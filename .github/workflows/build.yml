@@ -1,0 +1,78 @@
+name: build cache
+
+# Builds the tetron-nixos suite packages for x86_64-linux and aarch64-linux
+# and uploads the paths cache.nixos.org lacks to the `cache` release.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: tetron-nixos branch, tag or commit
+        required: true
+        default: main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cache
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      # The release and its nix-cache-info, once. Priority 50: Nix asks
+      # cache.nixos.org (40) first.
+      - name: Ensure the cache release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view cache -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 || \
+            gh release create cache -R "$GITHUB_REPOSITORY" --title "Nix binary cache" \
+              --notes "Signed Nix binary cache for tetron-nixos. See the README."
+          if ! gh release view cache -R "$GITHUB_REPOSITORY" --json assets -q '.assets[].name' | grep -qx nix-cache-info; then
+            printf 'StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 50\n' > nix-cache-info
+            gh release upload cache nix-cache-info -R "$GITHUB_REPOSITORY"
+          fi
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04, system: x86_64-linux }
+          - { runner: ubuntu-24.04-arm, system: aarch64-linux }
+    runs-on: ${{ matrix.runner }}
+    env:
+      NIX_CONFIG: |
+        experimental-features = nix-command flakes
+        access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Nix
+        run: |
+          curl -fsSL https://nixos.org/nix/install -o nix-install
+          sh nix-install --no-daemon --yes
+          echo "$HOME/.nix-profile/bin" >> "$GITHUB_PATH"
+      - name: Build
+        env:
+          REF: ${{ inputs.ref }}
+          SYSTEM: ${{ matrix.system }}
+        run: |
+          flake="github:tetronos/tetron-nixos/$REF"
+          nix flake metadata "$flake" --json | jq -r '"tetron-nixos " + .locked.rev'
+          for p in tetron tetron-wm tetron-tui casttui kmscon; do
+            nix build "$flake#packages.$SYSTEM.$p" --no-link --print-out-paths -L >> outs
+          done
+          cat outs
+      - name: Push
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NIX_SIGNING_KEY: ${{ secrets.NIX_SIGNING_KEY }}
+        run: |
+          umask 077
+          printf '%s' "$NIX_SIGNING_KEY" > "$RUNNER_TEMP/sk"
+          NIX_SIGNING_KEY_FILE="$RUNNER_TEMP/sk" sh scripts/push.sh $(cat outs)
+          rm -f "$RUNNER_TEMP/sk"
